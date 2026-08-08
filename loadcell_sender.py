@@ -392,11 +392,26 @@ async def _wifi_discovery_loop() -> str:
         await asyncio.sleep(5)
 
 
+async def _bt_prepare_in_background():
+    """Scan en koppel Bluetooth op de achtergrond terwijl hotspot actief is."""
+    global _cached_bt_mac
+    if _cached_bt_mac:
+        await ensure_bt_paired(_cached_bt_mac)
+        return
+    mac = await discover_bt_mac()
+    if mac:
+        await ensure_bt_paired(mac)
+        log.info("Bluetooth voorbereid op de achtergrond: %s", mac)
+
+
 async def transport_loop():
     """
     Verbindingsvolgorde:
       1. Installatie-hotspot  (MIXMATE-SETUP, primair)
       2. Bluetooth RFCOMM     (fallback)
+
+    Zodra hotspot actief is wordt Bluetooth op de achtergrond al gekoppeld,
+    zodat de overschakeling naar BT direct gaat als de hotspot wegvalt.
     """
     global _active_transport
 
@@ -408,11 +423,15 @@ async def transport_loop():
         ok = await connect_to_hotspot()
         if ok:
             _active_transport = "hotspot"
+            # Koppel Bluetooth alvast op de achtergrond
+            bt_task = asyncio.create_task(_bt_prepare_in_background())
             try:
                 await wifi_send_loop(HOTSPOT_GATEWAY)
-                continue
             except Exception as e:
                 log.warning("Hotspot WebSocket mislukt: %s", e)
+            finally:
+                bt_task.cancel()
+            continue
 
         # ── 2. Bluetooth fallback ─────────────────────────────────────────────
         _active_transport = "bluetooth"
