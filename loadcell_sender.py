@@ -176,9 +176,9 @@ def discover_pompmodule_ip() -> str | None:
         found = threading.Event()
         addr_ref = [None]
 
-        def on_change(zc, svc_type, name, state_change):
+        def on_change(zeroconf, service_type, name, state_change, **kwargs):
             if state_change == ServiceStateChange.Added:
-                info = zc.get_service_info(svc_type, name)
+                info = zeroconf.get_service_info(service_type, name)
                 if info and info.addresses:
                     addr_ref[0] = str(ipaddress.ip_address(info.addresses[0]))
                     found.set()
