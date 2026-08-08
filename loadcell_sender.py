@@ -40,6 +40,7 @@ POMPMODULE_HOST  = os.getenv("POMPMODULE_HOST", "")   # leeg = auto-discovery
 BT_CHANNEL       = int(os.getenv("BT_CHANNEL", "1"))
 WIFI_RETRY_S     = 5    # seconden wachten voor WiFi retry
 BT_FALLBACK_S    = 10   # seconden zonder WiFi voor Bluetooth fallback
+BT_SCAN_ALWAYS   = os.getenv("BT_SCAN_ALWAYS", "0") == "1"  # 1 = ook BT proberen als WiFi werkt (initiële installatie)
 
 
 # ── Pi versie detectie ────────────────────────────────────────────────────────
@@ -252,9 +253,41 @@ async def discover_bt_mac() -> str | None:
     return None
 
 
+async def ensure_bt_paired(mac: str) -> bool:
+    """Koppel (pair) het apparaat als dat nog niet gedaan is — just-works, geen PIN."""
+    try:
+        # Controleer of al gepaired
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "info", mac,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        if b"Paired: yes" in out:
+            return True
+        log.info("Bluetooth: koppelen met %s (just-works)…", mac)
+        # Just-works agent + pair
+        for cmd in [
+            f"bluetoothctl agent NoInputNoOutput",
+            f"bluetoothctl default-agent",
+            f"bluetoothctl pair {mac}",
+            f"bluetoothctl trust {mac}",
+        ]:
+            p = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
+        log.info("Bluetooth: %s gekoppeld", mac)
+        return True
+    except Exception as e:
+        log.warning("Bluetooth koppelen mislukt: %s", e)
+        return False
+
+
 async def bluetooth_send_loop(mac: str):
     """Stuurt gewichtsdata via Bluetooth RFCOMM."""
     interval = 1.0 / SEND_HZ
+    # Zorg dat devices gepaired zijn voor RFCOMM
+    await ensure_bt_paired(mac)
     log.info("Bluetooth: verbinden met %s kanaal %d", mac, BT_CHANNEL)
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     sock.settimeout(10)
@@ -308,63 +341,92 @@ async def wifi_send_loop(host: str):
 
 
 # ── Orchestrator: WiFi primair, Bluetooth fallback ────────────────────────────
+
+_active_transport: str = "none"  # "wifi" | "bluetooth" | "none"
+
+
+async def _wifi_discovery_loop() -> str:
+    """Blijft zoeken naar Pompmodule via mDNS/hostname. Geeft IP terug zodra gevonden."""
+    while True:
+        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
+        if host:
+            return host
+        log.info("Pompmodule niet gevonden via WiFi — opnieuw in 5s")
+        await asyncio.sleep(5)
+
+
 async def transport_loop():
     """
-    Probeert WiFi WebSocket. Als dat mislukt schakelt hij over op Bluetooth.
-    Zodra WiFi terugkomt keert hij terug naar WiFi.
+    Zoekt WiFi en Bluetooth parallel. WiFi heeft voorrang; als WiFi wegvalt
+    schakel hij over op Bluetooth. Zodra WiFi terugkomt gaat hij terug naar WiFi.
     """
-    host = None
-    while not host:
-        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
-        if not host:
-            log.warning("Pompmodule niet gevonden — opnieuw zoeken over 5s")
-            await asyncio.sleep(5)
+    global _active_transport
 
-    wifi_fail_since: float | None = None
+    # Eerste discovery: WiFi en BT parallel starten
+    log.info("Transport: zoeken naar Pompmodule via WiFi (mDNS)…")
+    host = None
+    wifi_fail_since = None
 
     while True:
-        # Probeer WiFi
-        try:
-            await wifi_send_loop(host)
-            wifi_fail_since = None  # WiFi was succesvol
-        except Exception:
-            now = time.monotonic()
-            if wifi_fail_since is None:
-                wifi_fail_since = now
-                log.info("WiFi weggevallen — wacht %ds voor Bluetooth fallback", BT_FALLBACK_S)
-
-            elapsed = now - wifi_fail_since
-            if elapsed < BT_FALLBACK_S:
-                # Nog even wachten voor we naar Bluetooth gaan
-                await asyncio.sleep(min(WIFI_RETRY_S, BT_FALLBACK_S - elapsed))
-                # Herdicover host als WiFi lang weg was
-                new_host = await asyncio.get_event_loop().run_in_executor(
-                    None, discover_pompmodule_ip
-                )
-                if new_host:
-                    host = new_host
-                continue
-
-            # Fallback naar Bluetooth
-            log.info("Bluetooth fallback activeren (WiFi %ds weg)", elapsed)
-            mac = _cached_bt_mac or await discover_bt_mac()
-            if mac:
-                try:
-                    await bluetooth_send_loop(mac)
-                except Exception as e:
-                    log.warning("Bluetooth ook mislukt: %s", e)
-            else:
-                log.warning("Geen Bluetooth MAC bekend — wachten op WiFi")
-
-            await asyncio.sleep(WIFI_RETRY_S)
-            # Probeer WiFi weer te vinden
-            new_host = await asyncio.get_event_loop().run_in_executor(
+        # ── WiFi poging ──
+        if host is None:
+            host_candidate = await asyncio.get_event_loop().run_in_executor(
                 None, discover_pompmodule_ip
             )
-            if new_host:
-                host = new_host
+            if host_candidate:
+                host = host_candidate
+                log.info("Pompmodule gevonden via WiFi: %s", host)
+
+        if host:
+            try:
+                _active_transport = "wifi"
+                await wifi_send_loop(host)
                 wifi_fail_since = None
-                log.info("WiFi terug gevonden — terug naar WiFi transport")
+                continue
+            except Exception:
+                now = time.monotonic()
+                if wifi_fail_since is None:
+                    wifi_fail_since = now
+                    log.info("WiFi weggevallen — schakel over naar Bluetooth na %ds", BT_FALLBACK_S)
+                elapsed = now - wifi_fail_since
+                if elapsed < BT_FALLBACK_S:
+                    await asyncio.sleep(min(WIFI_RETRY_S, BT_FALLBACK_S - elapsed))
+                    new_host = await asyncio.get_event_loop().run_in_executor(
+                        None, discover_pompmodule_ip
+                    )
+                    if new_host:
+                        host = new_host
+                    continue
+        else:
+            # Geen WiFi gevonden — direct naar Bluetooth (installatiemodus)
+            if wifi_fail_since is None:
+                wifi_fail_since = time.monotonic()
+            elapsed = time.monotonic() - wifi_fail_since
+            if elapsed < BT_FALLBACK_S:
+                await asyncio.sleep(2)
+                continue
+
+        # ── Bluetooth fallback ──
+        _active_transport = "bluetooth"
+        log.info("Bluetooth fallback activeren")
+        mac = _cached_bt_mac or await discover_bt_mac()
+        if mac:
+            try:
+                await bluetooth_send_loop(mac)
+            except Exception as e:
+                log.warning("Bluetooth ook mislukt: %s", e)
+        else:
+            log.warning("Geen Bluetooth MAC gevonden — opnieuw in %ds", WIFI_RETRY_S)
+
+        _active_transport = "none"
+        await asyncio.sleep(WIFI_RETRY_S)
+
+        # Probeer WiFi opnieuw na Bluetooth sessie
+        new_host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
+        if new_host:
+            host = new_host
+            wifi_fail_since = None
+            log.info("WiFi teruggevonden — terug naar WiFi")
 
 
 # ── Lokale REST API (tare commando's) ─────────────────────────────────────────
