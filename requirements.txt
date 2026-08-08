@@ -1,4 +1,9 @@
 websockets>=12.0
 zeroconf>=0.131.0
-RPi.GPIO>=0.7.1
-hx711>=0.1.0
+
+# Pi 4: GPIO + HX711
+RPi.GPIO>=0.7.1; platform_machine=="armv7l"
+hx711>=0.1.0; platform_machine=="armv7l"
+
+# Pi 5: lgpio (vervangt RPi.GPIO)
+lgpio>=0.2.2; platform_machine=="aarch64"

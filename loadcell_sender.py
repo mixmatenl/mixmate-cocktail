@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
 MIXMATE Cocktailmachine — Loadcell Sender
-Draait op de Cocktailmachine-Pi (2e Pi).
+Draait op de Cocktailmachine-Pi (Pi 4 of Pi 5).
 
-Leest de HX711 weegschaal uit en stuurt meetwaarden via WebSocket
-naar de Pompmodule-Pi. Vindt de Pompmodule automatisch via mDNS.
+Transportlagen (automatische fallback):
+  1. WiFi  → WebSocket naar Pompmodule op ws://<pompmodule>:8000/ws/loadcell
+  2. Bluetooth → RFCOMM naar Pompmodule als WiFi wegvalt
+
+Hardware:
+  Pi 4 → hx711 library + RPi.GPIO
+  Pi 5 → lgpio bit-banging (RPi.GPIO werkt niet op Pi 5)
 
 Vereisten:
-    pip install websockets hx711 RPi.GPIO zeroconf
+  pip install websockets zeroconf
+  Pi 4: pip install RPi.GPIO hx711
+  Pi 5: pip install lgpio
 """
+
 import asyncio
 import json
 import logging
 import os
 import socket
-import sys
+import struct
 import time
 
 logging.basicConfig(
@@ -23,155 +31,352 @@ logging.basicConfig(
 )
 log = logging.getLogger("loadcell")
 
-# ── Configuratie (overridebaar via omgevingsvariabelen) ────────────────────────
-DOUT_PIN    = int(os.getenv("LOADCELL_DOUT",  "5"))
-SCK_PIN     = int(os.getenv("LOADCELL_SCK",   "6"))
-SCALE       = float(os.getenv("LOADCELL_SCALE", "1.0"))
-SEND_HZ     = int(os.getenv("LOADCELL_HZ",    "10"))   # meetfrequentie
-POMPMODULE_HOST = os.getenv("POMPMODULE_HOST", "")     # leeg = auto-discovery
+# ── Configuratie ───────────────────────────────────────────────────────────────
+DOUT_PIN         = int(os.getenv("LOADCELL_DOUT",   "5"))
+SCK_PIN          = int(os.getenv("LOADCELL_SCK",    "6"))
+SCALE            = float(os.getenv("LOADCELL_SCALE", "1.0"))
+SEND_HZ          = int(os.getenv("LOADCELL_HZ",     "10"))
+POMPMODULE_HOST  = os.getenv("POMPMODULE_HOST", "")   # leeg = auto-discovery
+BT_CHANNEL       = int(os.getenv("BT_CHANNEL", "1"))
+WIFI_RETRY_S     = 5    # seconden wachten voor WiFi retry
+BT_FALLBACK_S    = 10   # seconden zonder WiFi voor Bluetooth fallback
 
-# ── Hardware ───────────────────────────────────────────────────────────────────
-try:
-    from hx711 import HX711
-    hx = HX711(DOUT_PIN, SCK_PIN)
-    hx.set_reading_format("MSB", "MSB")
-    hx.set_reference_unit(SCALE)
-    hx.reset()
-    hx.tare()
-    log.info("HX711 initialisatie geslaagd (DOUT=%d, SCK=%d)", DOUT_PIN, SCK_PIN)
-    HAS_HX711 = True
-except Exception as e:
-    log.warning("HX711 niet beschikbaar (%s) — mock modus actief", e)
-    HAS_HX711 = False
-    hx = None
 
+# ── Pi versie detectie ────────────────────────────────────────────────────────
+def _detect_pi_version() -> int:
+    try:
+        info = open("/proc/cpuinfo").read()
+        if "BCM2712" in info or "Raspberry Pi 5" in info:
+            return 5
+    except Exception:
+        pass
+    return 4
+
+PI_VERSION = _detect_pi_version()
+log.info("Raspberry Pi versie gedetecteerd: Pi %d", PI_VERSION)
+
+
+# ── HX711 voor Pi 5 (lgpio bit-banging) ──────────────────────────────────────
+class HX711lgpio:
+    """Minimale HX711 implementatie via lgpio — werkt op Pi 5."""
+
+    def __init__(self, dout: int, sck: int, gain: int = 128):
+        import lgpio
+        self._lg = lgpio
+        self._h    = lgpio.gpiochip_open(0)
+        self._dout = dout
+        self._sck  = sck
+        self._gain_pulses = {128: 1, 64: 3, 32: 2}[gain]
+        self._scale      = 1.0
+        self._tare_val   = 0.0
+
+        lgpio.gpio_claim_input(self._h, dout)
+        lgpio.gpio_claim_output(self._h, sck, lgpio.SET_PULL_NONE, 0)
+        self.tare()
+
+    def _wait_ready(self, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._lg.gpio_read(self._h, self._dout) == 1:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
+    def _read_raw(self) -> int:
+        if not self._wait_ready():
+            return 0
+        val = 0
+        for _ in range(24):
+            self._lg.gpio_write(self._h, self._sck, 1)
+            time.sleep(1e-5)
+            bit = self._lg.gpio_read(self._h, self._dout)
+            self._lg.gpio_write(self._h, self._sck, 0)
+            time.sleep(1e-5)
+            val = (val << 1) | bit
+        # Extra klokpulsen voor gain instelling
+        for _ in range(self._gain_pulses):
+            self._lg.gpio_write(self._h, self._sck, 1)
+            time.sleep(1e-5)
+            self._lg.gpio_write(self._h, self._sck, 0)
+            time.sleep(1e-5)
+        # Two's complement voor 24-bit signed integer
+        if val & 0x800000:
+            val -= 0x1000000
+        return val
+
+    def tare(self, times: int = 10):
+        readings = [self._read_raw() for _ in range(times)]
+        self._tare_val = sum(readings) / len(readings)
+
+    def get_weight(self, times: int = 3) -> float:
+        readings = [self._read_raw() for _ in range(times)]
+        avg = sum(readings) / len(readings)
+        return (avg - self._tare_val) / self._scale if self._scale != 0 else 0.0
+
+    def set_reference_unit(self, scale: float):
+        self._scale = scale
+
+    def reset(self):
+        self._lg.gpio_write(self._h, self._sck, 1)
+        time.sleep(0.0001)
+        self._lg.gpio_write(self._h, self._sck, 0)
+
+
+# ── Hardware initialisatie ────────────────────────────────────────────────────
+hx   = None
 _mock_weight = 0.0
+
+def _init_hardware():
+    global hx
+    if PI_VERSION >= 5:
+        try:
+            hx = HX711lgpio(DOUT_PIN, SCK_PIN)
+            hx.set_reference_unit(SCALE)
+            log.info("HX711 via lgpio (Pi 5) geïnitialiseerd — DOUT=%d SCK=%d", DOUT_PIN, SCK_PIN)
+            return
+        except Exception as e:
+            log.warning("lgpio HX711 mislukt: %s", e)
+    # Pi 4: standaard hx711 library
+    try:
+        from hx711 import HX711
+        hx = HX711(DOUT_PIN, SCK_PIN)
+        hx.set_reading_format("MSB", "MSB")
+        hx.set_reference_unit(SCALE)
+        hx.reset()
+        hx.tare()
+        log.info("HX711 via RPi.GPIO (Pi 4) geïnitialiseerd — DOUT=%d SCK=%d", DOUT_PIN, SCK_PIN)
+    except Exception as e:
+        log.warning("HX711 niet beschikbaar: %s — mock modus actief", e)
+
+_init_hardware()
+
 
 def read_weight_grams() -> float:
     if hx:
         try:
-            val = hx.get_weight(3)
-            return max(0.0, float(val))
+            return max(0.0, float(hx.get_weight(3)))
         except Exception:
             return 0.0
-    # Mock: langzaam stijgend gewicht voor testen
+    # Mock: langzaam stijgend gewicht voor dev/test
     global _mock_weight
-    _mock_weight += 0.5
-    return _mock_weight % 500
+    _mock_weight = (_mock_weight + 0.3) % 500
+    return round(_mock_weight, 1)
 
 
-# ── mDNS auto-discovery ────────────────────────────────────────────────────────
-def _discover_pompmodule_mdns(timeout: float = 5.0) -> str | None:
-    """Zoek de Pompmodule via mDNS (_mixmate._tcp.local)."""
+# ── mDNS / hostname discovery ─────────────────────────────────────────────────
+def discover_pompmodule_ip() -> str | None:
+    # 1. Omgevingsvariabele
+    if POMPMODULE_HOST:
+        return POMPMODULE_HOST
+    # 2. mDNS via zeroconf
     try:
         from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange
+        import ipaddress, threading
+        found = threading.Event()
+        addr_ref = [None]
 
-        found_host = None
-
-        def on_change(zeroconf, service_type, name, state_change):
-            nonlocal found_host
+        def on_change(zc, svc_type, name, state_change):
             if state_change == ServiceStateChange.Added:
-                info = zeroconf.get_service_info(service_type, name)
+                info = zc.get_service_info(svc_type, name)
                 if info and info.addresses:
-                    import ipaddress
-                    addr = str(ipaddress.ip_address(info.addresses[0]))
-                    found_host = addr
-                    log.info("Pompmodule gevonden via mDNS: %s", addr)
+                    addr_ref[0] = str(ipaddress.ip_address(info.addresses[0]))
+                    found.set()
 
         zc = Zeroconf()
-        browser = ServiceBrowser(zc, "_mixmate._tcp.local.", handlers=[on_change])
-        deadline = time.monotonic() + timeout
-        while found_host is None and time.monotonic() < deadline:
-            time.sleep(0.2)
+        ServiceBrowser(zc, "_mixmate._tcp.local.", handlers=[on_change])
+        found.wait(timeout=5)
         zc.close()
-        return found_host
+        if addr_ref[0]:
+            log.info("Pompmodule gevonden via mDNS: %s", addr_ref[0])
+            return addr_ref[0]
     except Exception as e:
-        log.debug("mDNS discovery mislukt: %s", e)
-        return None
-
-
-def _discover_pompmodule_hostname() -> str | None:
-    """Probeer de vaste hostname mixmate.local te resolven."""
+        log.debug("mDNS mislukt: %s", e)
+    # 3. Hostname fallback
     for hostname in ("mixmate.local", "mixmate-pompmodule.local"):
         try:
-            addr = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
-            log.info("Pompmodule gevonden via hostname %s → %s", hostname, addr)
-            return addr
+            ip = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
+            log.info("Pompmodule gevonden via hostname %s → %s", hostname, ip)
+            return ip
         except Exception:
             pass
     return None
 
 
-def discover_pompmodule() -> str:
-    """
-    Geeft het IP-adres van de Pompmodule terug.
-    Volgorde: env var → mDNS → hostname → wacht en herhaal.
-    """
-    if POMPMODULE_HOST:
-        log.info("Pompmodule host uit omgevingsvariabele: %s", POMPMODULE_HOST)
-        return POMPMODULE_HOST
-
-    log.info("Auto-discovery Pompmodule gestart...")
-    while True:
-        host = _discover_pompmodule_mdns(timeout=5) or _discover_pompmodule_hostname()
-        if host:
-            return host
-        log.warning("Pompmodule niet gevonden — opnieuw zoeken over 5 seconden...")
-        time.sleep(5)
+# ── Bluetooth discovery & transport ──────────────────────────────────────────
+_cached_bt_mac: str | None = None
 
 
-# ── WebSocket verbinding & sturen ──────────────────────────────────────────────
-async def send_loop():
-    import websockets
+async def fetch_bt_mac_from_api(host: str) -> str | None:
+    """Haal het Bluetooth MAC-adres van de Pompmodule op via de lokale API."""
+    try:
+        import urllib.request
+        url = f"http://{host}:8000/api/system/bluetooth-address"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read())
+            return data.get("address")
+    except Exception:
+        return None
 
-    host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule)
-    ws_url = f"ws://{host}:8000/ws/loadcell"
+
+async def discover_bt_mac() -> str | None:
+    """Zoek het Bluetooth MAC-adres van de Pompmodule via bluetoothctl scan."""
+    global _cached_bt_mac
+    if _cached_bt_mac:
+        return _cached_bt_mac
+    log.info("Bluetooth: scannen naar MIXMATE Pompmodule…")
+    try:
+        # Start scan
+        scan_proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "scan", "on",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.sleep(8)
+        scan_proc.terminate()
+        # Zoek in device lijst
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "devices",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        for line in out.decode().splitlines():
+            upper = line.upper()
+            if "MIXMATE" in upper:
+                parts = line.split()
+                if len(parts) >= 2:
+                    mac = parts[1]
+                    log.info("Pompmodule Bluetooth gevonden: %s", mac)
+                    _cached_bt_mac = mac
+                    return mac
+    except Exception as e:
+        log.debug("Bluetooth scan mislukt: %s", e)
+    return None
+
+
+async def bluetooth_send_loop(mac: str):
+    """Stuurt gewichtsdata via Bluetooth RFCOMM."""
     interval = 1.0 / SEND_HZ
-    backoff = 2
+    log.info("Bluetooth: verbinden met %s kanaal %d", mac, BT_CHANNEL)
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    sock.settimeout(10)
+    try:
+        sock.connect((mac, BT_CHANNEL))
+        sock.settimeout(None)
+        log.info("Bluetooth verbonden")
+        loop = asyncio.get_event_loop()
+        while True:
+            weight_g = await loop.run_in_executor(None, read_weight_grams)
+            msg = json.dumps({"weight_g": round(weight_g, 1)}).encode() + b"\n"
+            await loop.run_in_executor(None, sock.sendall, msg)
+            await asyncio.sleep(interval)
+    except Exception as e:
+        log.warning("Bluetooth verbinding verbroken: %s", e)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
-    log.info("Verbinden met Pompmodule: %s", ws_url)
 
+# ── WiFi WebSocket transport ──────────────────────────────────────────────────
+async def wifi_send_loop(host: str):
+    """Stuurt gewichtsdata via WebSocket over WiFi."""
+    import websockets
+    ws_url  = f"ws://{host}:8000/ws/loadcell"
+    interval = 1.0 / SEND_HZ
+    backoff  = WIFI_RETRY_S
+    log.info("WiFi: verbinden met %s", ws_url)
     while True:
         try:
             async with websockets.connect(ws_url, ping_interval=10, ping_timeout=5) as ws:
-                backoff = 2
-                log.info("Verbonden met Pompmodule %s — sturen @ %dHz", host, SEND_HZ)
+                global _cached_bt_mac
+                if not _cached_bt_mac:
+                    mac = await fetch_bt_mac_from_api(host)
+                    if mac:
+                        _cached_bt_mac = mac
+                        log.info("BT MAC gecached: %s (klaar voor fallback)", mac)
+                backoff = WIFI_RETRY_S
+                log.info("WiFi verbonden met Pompmodule — %dHz", SEND_HZ)
                 while True:
                     weight_g = await asyncio.get_event_loop().run_in_executor(
                         None, read_weight_grams
                     )
                     await ws.send(json.dumps({"weight_g": round(weight_g, 1)}))
                     await asyncio.sleep(interval)
-
         except Exception as e:
-            log.warning("Verbinding verbroken: %s — herverbinden in %ds", e, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            log.warning("WiFi verbroken: %s — retry in %ds", e, backoff)
+            raise   # laat de orchestrator weten dat WiFi weg is
 
-            # Herdicover als verbinding lang weg was
-            if backoff >= 8:
-                log.info("Herdicover Pompmodule...")
+
+# ── Orchestrator: WiFi primair, Bluetooth fallback ────────────────────────────
+async def transport_loop():
+    """
+    Probeert WiFi WebSocket. Als dat mislukt schakelt hij over op Bluetooth.
+    Zodra WiFi terugkomt keert hij terug naar WiFi.
+    """
+    host = None
+    while not host:
+        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
+        if not host:
+            log.warning("Pompmodule niet gevonden — opnieuw zoeken over 5s")
+            await asyncio.sleep(5)
+
+    wifi_fail_since: float | None = None
+
+    while True:
+        # Probeer WiFi
+        try:
+            await wifi_send_loop(host)
+            wifi_fail_since = None  # WiFi was succesvol
+        except Exception:
+            now = time.monotonic()
+            if wifi_fail_since is None:
+                wifi_fail_since = now
+                log.info("WiFi weggevallen — wacht %ds voor Bluetooth fallback", BT_FALLBACK_S)
+
+            elapsed = now - wifi_fail_since
+            if elapsed < BT_FALLBACK_S:
+                # Nog even wachten voor we naar Bluetooth gaan
+                await asyncio.sleep(min(WIFI_RETRY_S, BT_FALLBACK_S - elapsed))
+                # Herdicover host als WiFi lang weg was
+                new_host = await asyncio.get_event_loop().run_in_executor(
+                    None, discover_pompmodule_ip
+                )
+                if new_host:
+                    host = new_host
+                continue
+
+            # Fallback naar Bluetooth
+            log.info("Bluetooth fallback activeren (WiFi %ds weg)", elapsed)
+            mac = _cached_bt_mac or await discover_bt_mac()
+            if mac:
                 try:
-                    host = await asyncio.get_event_loop().run_in_executor(
-                        None, discover_pompmodule
-                    )
-                    ws_url = f"ws://{host}:8000/ws/loadcell"
-                except Exception:
-                    pass
+                    await bluetooth_send_loop(mac)
+                except Exception as e:
+                    log.warning("Bluetooth ook mislukt: %s", e)
+            else:
+                log.warning("Geen Bluetooth MAC bekend — wachten op WiFi")
+
+            await asyncio.sleep(WIFI_RETRY_S)
+            # Probeer WiFi weer te vinden
+            new_host = await asyncio.get_event_loop().run_in_executor(
+                None, discover_pompmodule_ip
+            )
+            if new_host:
+                host = new_host
+                wifi_fail_since = None
+                log.info("WiFi terug gevonden — terug naar WiFi transport")
 
 
-# ── REST API (lokaal) — voor tare commando's van buitenaf ─────────────────────
-async def local_api(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Mini HTTP server op poort 8100 — accepteert POST /tare."""
+# ── Lokale REST API (tare commando's) ─────────────────────────────────────────
+async def _handle_local_request(reader, writer):
     try:
         data = await asyncio.wait_for(reader.read(512), timeout=2)
         if b"POST /tare" in data:
             if hx:
                 await asyncio.get_event_loop().run_in_executor(None, hx.tare)
-            response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
         else:
-            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-        writer.write(response)
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
     except Exception:
         pass
@@ -180,10 +385,10 @@ async def local_api(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
 
 async def main():
-    log.info("MIXMATE Loadcell Sender gestart")
-    server = await asyncio.start_server(local_api, "0.0.0.0", 8100)
-    log.info("Lokale API luistert op poort 8100 (POST /tare)")
-    await asyncio.gather(send_loop(), server.serve_forever())
+    log.info("MIXMATE Loadcell Sender gestart (Pi %d)", PI_VERSION)
+    server = await asyncio.start_server(_handle_local_request, "0.0.0.0", 8100)
+    log.info("Lokale API op poort 8100")
+    await asyncio.gather(transport_loop(), server.serve_forever())
 
 
 if __name__ == "__main__":
