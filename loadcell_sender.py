@@ -38,9 +38,11 @@ SCALE            = float(os.getenv("LOADCELL_SCALE", "1.0"))
 SEND_HZ          = int(os.getenv("LOADCELL_HZ",     "10"))
 POMPMODULE_HOST  = os.getenv("POMPMODULE_HOST", "")   # leeg = auto-discovery
 BT_CHANNEL       = int(os.getenv("BT_CHANNEL", "1"))
-WIFI_RETRY_S     = 5    # seconden wachten voor WiFi retry
-BT_FALLBACK_S    = 10   # seconden zonder WiFi voor Bluetooth fallback
-BT_SCAN_ALWAYS   = os.getenv("BT_SCAN_ALWAYS", "0") == "1"  # 1 = ook BT proberen als WiFi werkt (initiële installatie)
+WIFI_RETRY_S      = 5    # seconden wachten voor WiFi retry
+BT_FALLBACK_S     = 15   # seconden zonder WiFi voor Bluetooth fallback
+HOTSPOT_SSID      = os.getenv("HOTSPOT_SSID",     "MIXMATE-SETUP")
+HOTSPOT_PASSWORD  = os.getenv("HOTSPOT_PASSWORD",  "mixmate123")
+HOTSPOT_GATEWAY   = os.getenv("HOTSPOT_GATEWAY",   "10.42.0.1")
 
 
 # ── Pi versie detectie ────────────────────────────────────────────────────────
@@ -203,6 +205,38 @@ def discover_pompmodule_ip() -> str | None:
     return None
 
 
+# ── Installatie-hotspot verbinding ───────────────────────────────────────────
+
+async def connect_to_hotspot() -> bool:
+    """Verbindt de Cocktailmachine met de MIXMATE-SETUP hotspot van de Pompmodule."""
+    log.info("Hotspot: verbinden met '%s'…", HOTSPOT_SSID)
+    try:
+        # Check of al verbonden
+        rc_check, out_check = await _run(f'nmcli con show --active | grep "{HOTSPOT_SSID}"')
+        if rc_check == 0:
+            log.info("Hotspot: al verbonden met %s", HOTSPOT_SSID)
+            return True
+        rc, out = await _run(
+            f'nmcli device wifi connect "{HOTSPOT_SSID}" password "{HOTSPOT_PASSWORD}"'
+        )
+        if rc == 0:
+            log.info("Hotspot: verbonden met %s → gateway %s", HOTSPOT_SSID, HOTSPOT_GATEWAY)
+            await asyncio.sleep(2)  # wacht tot IP toegewezen is
+            return True
+        log.warning("Hotspot verbinden mislukt (rc=%d): %s", rc, out)
+    except Exception as e:
+        log.warning("Hotspot fout: %s", e)
+    return False
+
+
+async def _run(cmd: str) -> tuple:
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode().strip()
+
+
 # ── Bluetooth discovery & transport ──────────────────────────────────────────
 _cached_bt_mac: str | None = None
 
@@ -357,18 +391,20 @@ async def _wifi_discovery_loop() -> str:
 
 async def transport_loop():
     """
-    Zoekt WiFi en Bluetooth parallel. WiFi heeft voorrang; als WiFi wegvalt
-    schakel hij over op Bluetooth. Zodra WiFi terugkomt gaat hij terug naar WiFi.
+    Verbindingsvolgorde:
+      1. WiFi via mDNS/hostname  (primair, automatisch)
+      2. Installatie-hotspot      (MIXMATE-SETUP, voor eerste installatie)
+      3. Bluetooth RFCOMM         (fallback als hotspot ook niet werkt)
     """
     global _active_transport
 
-    # Eerste discovery: WiFi en BT parallel starten
-    log.info("Transport: zoeken naar Pompmodule via WiFi (mDNS)…")
-    host = None
+    log.info("Transport: zoeken naar Pompmodule…")
+    host            = None
     wifi_fail_since = None
+    hotspot_tried   = False
 
     while True:
-        # ── WiFi poging ──
+        # ── 1. WiFi via mDNS ──────────────────────────────────────────────────
         if host is None:
             host_candidate = await asyncio.get_event_loop().run_in_executor(
                 None, discover_pompmodule_ip
@@ -382,12 +418,12 @@ async def transport_loop():
                 _active_transport = "wifi"
                 await wifi_send_loop(host)
                 wifi_fail_since = None
+                hotspot_tried   = False
                 continue
             except Exception:
                 now = time.monotonic()
                 if wifi_fail_since is None:
                     wifi_fail_since = now
-                    log.info("WiFi weggevallen — schakel over naar Bluetooth na %ds", BT_FALLBACK_S)
                 elapsed = now - wifi_fail_since
                 if elapsed < BT_FALLBACK_S:
                     await asyncio.sleep(min(WIFI_RETRY_S, BT_FALLBACK_S - elapsed))
@@ -398,7 +434,6 @@ async def transport_loop():
                         host = new_host
                     continue
         else:
-            # Geen WiFi gevonden — direct naar Bluetooth (installatiemodus)
             if wifi_fail_since is None:
                 wifi_fail_since = time.monotonic()
             elapsed = time.monotonic() - wifi_fail_since
@@ -406,7 +441,22 @@ async def transport_loop():
                 await asyncio.sleep(2)
                 continue
 
-        # ── Bluetooth fallback ──
+        # ── 2. Installatie-hotspot ────────────────────────────────────────────
+        if not hotspot_tried:
+            hotspot_tried = True
+            log.info("Probeer installatie-hotspot '%s'…", HOTSPOT_SSID)
+            ok = await connect_to_hotspot()
+            if ok:
+                # Na verbinden met hotspot: Pompmodule op vaste gateway
+                _active_transport = "hotspot"
+                try:
+                    await wifi_send_loop(HOTSPOT_GATEWAY)
+                    wifi_fail_since = None
+                    continue
+                except Exception as e:
+                    log.warning("Hotspot WebSocket mislukt: %s", e)
+
+        # ── 3. Bluetooth fallback ─────────────────────────────────────────────
         _active_transport = "bluetooth"
         log.info("Bluetooth fallback activeren")
         mac = _cached_bt_mac or await discover_bt_mac()
@@ -420,8 +470,9 @@ async def transport_loop():
 
         _active_transport = "none"
         await asyncio.sleep(WIFI_RETRY_S)
+        hotspot_tried = False
 
-        # Probeer WiFi opnieuw na Bluetooth sessie
+        # Probeer WiFi opnieuw
         new_host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
         if new_host:
             host = new_host
