@@ -392,9 +392,8 @@ async def _wifi_discovery_loop() -> str:
 async def transport_loop():
     """
     Verbindingsvolgorde:
-      1. Installatie-hotspot      (MIXMATE-SETUP, primair)
-      2. Bluetooth RFCOMM         (fallback)
-      3. WiFi via mDNS/hostname   (als hotspot én Bluetooth niet werken)
+      1. Installatie-hotspot  (MIXMATE-SETUP, primair)
+      2. Bluetooth RFCOMM     (fallback)
     """
     global _active_transport
 
@@ -425,19 +424,7 @@ async def transport_loop():
         else:
             log.warning("Geen Bluetooth MAC gevonden")
 
-        # ── 3. WiFi via mDNS ─────────────────────────────────────────────────
-        log.info("Probeer WiFi via mDNS…")
-        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
-        if host:
-            _active_transport = "wifi"
-            try:
-                await wifi_send_loop(host)
-                continue
-            except Exception as e:
-                log.warning("WiFi WebSocket mislukt: %s", e)
-
         _active_transport = "none"
-        await asyncio.sleep(WIFI_RETRY_S)
         await asyncio.sleep(WIFI_RETRY_S)
         hotspot_tried = False
 
