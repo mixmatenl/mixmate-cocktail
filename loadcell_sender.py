@@ -216,8 +216,11 @@ async def connect_to_hotspot() -> bool:
         if rc_check == 0:
             log.info("Hotspot: al verbonden met %s", HOTSPOT_SSID)
             return True
+        # Scan zodat de SSID zichtbaar is voor nmcli
+        await _run("sudo nmcli device wifi rescan ifname wlan0")
+        await asyncio.sleep(3)
         rc, out = await _run(
-            f'nmcli device wifi connect "{HOTSPOT_SSID}" password "{HOTSPOT_PASSWORD}"'
+            f'sudo nmcli device wifi connect "{HOTSPOT_SSID}" password "{HOTSPOT_PASSWORD}"'
         )
         if rc == 0:
             log.info("Hotspot: verbonden met %s → gateway %s", HOTSPOT_SSID, HOTSPOT_GATEWAY)
@@ -426,14 +429,6 @@ async def transport_loop():
 
         _active_transport = "none"
         await asyncio.sleep(WIFI_RETRY_S)
-        hotspot_tried = False
-
-        # Probeer WiFi opnieuw
-        new_host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
-        if new_host:
-            host = new_host
-            wifi_fail_since = None
-            log.info("WiFi teruggevonden — terug naar WiFi")
 
 
 # ── Lokale REST API (tare commando's) ─────────────────────────────────────────

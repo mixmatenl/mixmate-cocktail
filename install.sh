@@ -38,6 +38,10 @@ else
     pip3 install --break-system-packages RPi.GPIO hx711
 fi
 
+# ── Sudoers voor nmcli (hotspot verbinding) ───────────────────────────────────
+echo "pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli" | sudo tee /etc/sudoers.d/mixmate-cocktail > /dev/null
+sudo chmod 440 /etc/sudoers.d/mixmate-cocktail
+
 # ── Systemd service ───────────────────────────────────────────────────────────
 echo "[4/4] Service installeren..."
 sudo cp "$INSTALL_DIR/mixmate-cocktail.service" /etc/systemd/system/
