@@ -4,8 +4,8 @@ MIXMATE Cocktailmachine — Loadcell Sender
 Draait op de Cocktailmachine-Pi (Pi 4 of Pi 5).
 
 Transportlagen (automatische fallback):
-  1. WiFi  → WebSocket naar Pompmodule op ws://<pompmodule>:8000/ws/loadcell
-  2. Bluetooth → RFCOMM naar Pompmodule als WiFi wegvalt
+  1. Installatie-hotspot → WebSocket naar Pompmodule op ws://10.42.0.1:8000/ws/loadcell
+  2. Bluetooth RFCOMM    → fallback als hotspot niet beschikbaar is
 
 Hardware:
   Pi 4 → hx711 library + RPi.GPIO
@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import socket
-import struct
 import time
 
 logging.basicConfig(
@@ -165,44 +164,6 @@ def read_weight_grams() -> float:
     _mock_weight = (_mock_weight + 0.3) % 500
     return round(_mock_weight, 1)
 
-
-# ── mDNS / hostname discovery ─────────────────────────────────────────────────
-def discover_pompmodule_ip() -> str | None:
-    # 1. Omgevingsvariabele
-    if POMPMODULE_HOST:
-        return POMPMODULE_HOST
-    # 2. mDNS via zeroconf
-    try:
-        from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange
-        import ipaddress, threading
-        found = threading.Event()
-        addr_ref = [None]
-
-        def on_change(zeroconf, service_type, name, state_change, **kwargs):
-            if state_change == ServiceStateChange.Added:
-                info = zeroconf.get_service_info(service_type, name)
-                if info and info.addresses:
-                    addr_ref[0] = str(ipaddress.ip_address(info.addresses[0]))
-                    found.set()
-
-        zc = Zeroconf()
-        ServiceBrowser(zc, "_mixmate._tcp.local.", handlers=[on_change])
-        found.wait(timeout=5)
-        zc.close()
-        if addr_ref[0]:
-            log.info("Pompmodule gevonden via mDNS: %s", addr_ref[0])
-            return addr_ref[0]
-    except Exception as e:
-        log.debug("mDNS mislukt: %s", e)
-    # 3. Hostname fallback
-    for hostname in ("mixmate.local", "mixmate-pompmodule.local"):
-        try:
-            ip = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
-            log.info("Pompmodule gevonden via hostname %s → %s", hostname, ip)
-            return ip
-        except Exception:
-            pass
-    return None
 
 
 # ── Installatie-hotspot verbinding ───────────────────────────────────────────
@@ -381,15 +342,6 @@ async def wifi_send_loop(host: str):
 
 _active_transport: str = "none"  # "wifi" | "bluetooth" | "none"
 
-
-async def _wifi_discovery_loop() -> str:
-    """Blijft zoeken naar Pompmodule via mDNS/hostname. Geeft IP terug zodra gevonden."""
-    while True:
-        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
-        if host:
-            return host
-        log.info("Pompmodule niet gevonden via WiFi — opnieuw in 5s")
-        await asyncio.sleep(5)
 
 
 async def _bt_prepare_in_background():
