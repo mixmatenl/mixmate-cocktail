@@ -392,83 +392,52 @@ async def _wifi_discovery_loop() -> str:
 async def transport_loop():
     """
     Verbindingsvolgorde:
-      1. WiFi via mDNS/hostname  (primair, automatisch)
-      2. Installatie-hotspot      (MIXMATE-SETUP, voor eerste installatie)
-      3. Bluetooth RFCOMM         (fallback als hotspot ook niet werkt)
+      1. Installatie-hotspot      (MIXMATE-SETUP, primair)
+      2. Bluetooth RFCOMM         (fallback)
+      3. WiFi via mDNS/hostname   (als hotspot én Bluetooth niet werken)
     """
     global _active_transport
 
     log.info("Transport: zoeken naar Pompmodule…")
-    host            = None
-    wifi_fail_since = None
-    hotspot_tried   = False
 
     while True:
-        # ── 1. WiFi via mDNS ──────────────────────────────────────────────────
-        if host is None:
-            host_candidate = await asyncio.get_event_loop().run_in_executor(
-                None, discover_pompmodule_ip
-            )
-            if host_candidate:
-                host = host_candidate
-                log.info("Pompmodule gevonden via WiFi: %s", host)
-
-        if host:
+        # ── 1. Installatie-hotspot ────────────────────────────────────────────
+        log.info("Probeer installatie-hotspot '%s'…", HOTSPOT_SSID)
+        ok = await connect_to_hotspot()
+        if ok:
+            _active_transport = "hotspot"
             try:
-                _active_transport = "wifi"
-                await wifi_send_loop(host)
-                wifi_fail_since = None
-                hotspot_tried   = False
+                await wifi_send_loop(HOTSPOT_GATEWAY)
                 continue
-            except Exception:
-                now = time.monotonic()
-                if wifi_fail_since is None:
-                    wifi_fail_since = now
-                elapsed = now - wifi_fail_since
-                if elapsed < BT_FALLBACK_S:
-                    await asyncio.sleep(min(WIFI_RETRY_S, BT_FALLBACK_S - elapsed))
-                    new_host = await asyncio.get_event_loop().run_in_executor(
-                        None, discover_pompmodule_ip
-                    )
-                    if new_host:
-                        host = new_host
-                    continue
-        else:
-            if wifi_fail_since is None:
-                wifi_fail_since = time.monotonic()
-            elapsed = time.monotonic() - wifi_fail_since
-            if elapsed < BT_FALLBACK_S:
-                await asyncio.sleep(2)
-                continue
+            except Exception as e:
+                log.warning("Hotspot WebSocket mislukt: %s", e)
 
-        # ── 2. Installatie-hotspot ────────────────────────────────────────────
-        if not hotspot_tried:
-            hotspot_tried = True
-            log.info("Probeer installatie-hotspot '%s'…", HOTSPOT_SSID)
-            ok = await connect_to_hotspot()
-            if ok:
-                # Na verbinden met hotspot: Pompmodule op vaste gateway
-                _active_transport = "hotspot"
-                try:
-                    await wifi_send_loop(HOTSPOT_GATEWAY)
-                    wifi_fail_since = None
-                    continue
-                except Exception as e:
-                    log.warning("Hotspot WebSocket mislukt: %s", e)
-
-        # ── 3. Bluetooth fallback ─────────────────────────────────────────────
+        # ── 2. Bluetooth fallback ─────────────────────────────────────────────
         _active_transport = "bluetooth"
         log.info("Bluetooth fallback activeren")
         mac = _cached_bt_mac or await discover_bt_mac()
         if mac:
             try:
                 await bluetooth_send_loop(mac)
+                continue
             except Exception as e:
                 log.warning("Bluetooth ook mislukt: %s", e)
         else:
-            log.warning("Geen Bluetooth MAC gevonden — opnieuw in %ds", WIFI_RETRY_S)
+            log.warning("Geen Bluetooth MAC gevonden")
+
+        # ── 3. WiFi via mDNS ─────────────────────────────────────────────────
+        log.info("Probeer WiFi via mDNS…")
+        host = await asyncio.get_event_loop().run_in_executor(None, discover_pompmodule_ip)
+        if host:
+            _active_transport = "wifi"
+            try:
+                await wifi_send_loop(host)
+                continue
+            except Exception as e:
+                log.warning("WiFi WebSocket mislukt: %s", e)
 
         _active_transport = "none"
+        await asyncio.sleep(WIFI_RETRY_S)
         await asyncio.sleep(WIFI_RETRY_S)
         hotspot_tried = False
 
