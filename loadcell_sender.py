@@ -31,6 +31,8 @@ logging.basicConfig(
 log = logging.getLogger("loadcell")
 
 # ── Configuratie ───────────────────────────────────────────────────────────────
+VERSION          = os.getenv("MIXMATE_COCKTAIL_VERSION", "1.0.0")
+
 DOUT_PIN         = int(os.getenv("LOADCELL_DOUT",   "5"))
 SCK_PIN          = int(os.getenv("LOADCELL_SCK",    "6"))
 SCALE            = float(os.getenv("LOADCELL_SCALE", "1.0"))
@@ -151,6 +153,16 @@ def _init_hardware():
         log.warning("HX711 niet beschikbaar: %s — mock modus actief", e)
 
 _init_hardware()
+
+
+def _get_serial() -> str:
+    try:
+        for line in open("/proc/cpuinfo").read().splitlines():
+            if line.startswith("Serial"):
+                return line.split(":")[1].strip()
+    except Exception:
+        pass
+    return ""
 
 
 def read_weight_grams() -> float:
@@ -319,6 +331,12 @@ async def wifi_send_loop(host: str):
     while True:
         try:
             async with websockets.connect(ws_url, ping_interval=10, ping_timeout=5) as ws:
+                # Stuur hello zodat Pompmodule deze Cocktailmachine kan registreren
+                await ws.send(json.dumps({
+                    "hello": True,
+                    "version": VERSION,
+                    "serial_number": _get_serial(),
+                }))
                 global _cached_bt_mac
                 if not _cached_bt_mac:
                     mac = await fetch_bt_mac_from_api(host)
